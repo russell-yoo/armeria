@@ -63,10 +63,7 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoop;
-import io.netty.channel.unix.DomainSocketAddress;
 import io.netty.handler.proxy.HttpProxyHandler;
 import io.netty.handler.proxy.ProxyConnectException;
 import io.netty.handler.proxy.ProxyHandler;
@@ -94,8 +91,6 @@ final class HttpChannelPool implements AsyncCloseable {
 
     // Fields for creating a new connection:
     private final Bootstraps bootstraps;
-    private final int connectTimeoutMillis;
-
     private final SslContext sslCtxHttp1Or2;
     private final SslContext sslCtxHttp1Only;
 
@@ -112,8 +107,7 @@ final class HttpChannelPool implements AsyncCloseable {
         this.sslCtxHttp1Only = sslCtxHttp1Only;
         this.sslCtxHttp1Or2 = sslCtxHttp1Or2;
 
-        bootstraps = new Bootstraps();
-        connectTimeoutMillis = bootstraps.connectTimeoutMillis;
+        bootstraps = new Bootstraps(clientFactory, eventLoop, sslCtxHttp1Only, sslCtxHttp1Or2);
     }
 
     private SslContext determineSslContext(SessionProtocol desiredProtocol) {
@@ -154,7 +148,7 @@ final class HttpChannelPool implements AsyncCloseable {
             default:
                 throw new Error(); // Should never reach here.
         }
-        proxyHandler.setConnectTimeoutMillis(connectTimeoutMillis);
+        proxyHandler.setConnectTimeoutMillis(bootstraps.getConnectTimeoutMillis());
         ch.pipeline().addFirst(proxyHandler);
 
         if (proxyConfig instanceof ConnectProxyConfig && ((ConnectProxyConfig) proxyConfig).useTls()) {
@@ -448,7 +442,7 @@ final class HttpChannelPool implements AsyncCloseable {
                     desiredProtocol, "connection established, but session creation timed out: " + ch))) {
                 ch.close();
             }
-        }, connectTimeoutMillis, TimeUnit.MILLISECONDS);
+        }, bootstraps.getConnectTimeoutMillis(), TimeUnit.MILLISECONDS);
 
         ch.pipeline().addLast(
                 new HttpSessionHandler(this, ch, sessionPromise, timeoutFuture,
@@ -883,86 +877,5 @@ final class HttpChannelPool implements AsyncCloseable {
                 handler.accept(value);
             }
         }
-    }
-
-    final class Bootstraps {
-        private final Bootstrap[][] inetBootstraps;
-        @Nullable
-        private final Bootstrap[][] unixBootstraps;
-        private final int connectTimeoutMillis;
-
-        Bootstraps() {
-            final Bootstrap inetBaseBootstrap = clientFactory.newInetBootstrap();
-            final Bootstrap unixBaseBootstrap = clientFactory.newUnixBootstrap();
-            inetBootstraps = newBootstrapMap(inetBaseBootstrap, clientFactory, eventLoop);
-            if (unixBaseBootstrap != null) {
-                unixBootstraps = newBootstrapMap(unixBaseBootstrap, clientFactory, eventLoop);
-            } else {
-                unixBootstraps = null;
-            }
-            connectTimeoutMillis = (Integer) inetBaseBootstrap.config().options()
-                                                              .get(ChannelOption.CONNECT_TIMEOUT_MILLIS);
-        }
-
-        Bootstrap get(SocketAddress remoteAddress, SessionProtocol desiredProtocol,
-                              SerializationFormat serializationFormat) {
-            if (!httpAndHttpsValues().contains(desiredProtocol)) {
-                throw new NullPointerException("Unsupported session protocol: " + desiredProtocol);
-            }
-
-            if (remoteAddress instanceof InetSocketAddress) {
-                return select(inetBootstraps, desiredProtocol, serializationFormat);
-            }
-
-            assert remoteAddress instanceof DomainSocketAddress : remoteAddress;
-
-            if (unixBootstraps == null) {
-                throw new IllegalArgumentException("Domain sockets are not supported by " +
-                                                   eventLoop.getClass().getName());
-            }
-
-            return select(unixBootstraps, desiredProtocol, serializationFormat);
-        }
-
-        private Bootstrap select(Bootstrap[][] bootstraps, SessionProtocol desiredProtocol, SerializationFormat serializationFormat) {
-            return bootstraps[desiredProtocol.ordinal()][toIndex(serializationFormat)];
-        }
-
-        private Bootstrap[][] newBootstrapMap(Bootstrap baseBootstrap,
-                                              HttpClientFactory clientFactory,
-                                              EventLoop eventLoop) {
-            baseBootstrap.group(eventLoop);
-            final Set<SessionProtocol> sessionProtocols = httpAndHttpsValues();
-            final Bootstrap[][] maps = (Bootstrap[][]) Array.newInstance(
-                    Bootstrap.class, SessionProtocol.values().length, 2);
-            // Attempting to access the array with an unallowed protocol will trigger NPE,
-            // which will help us find a bug.
-            for (SessionProtocol p : sessionProtocols) {
-                final SslContext sslCtx = determineSslContext(p);
-                setBootstrap(baseBootstrap.clone(), clientFactory, maps, p, sslCtx, true);
-                setBootstrap(baseBootstrap.clone(), clientFactory, maps, p, sslCtx, false);
-            }
-            return maps;
-        }
-        private void setBootstrap(Bootstrap bootstrap, HttpClientFactory clientFactory, Bootstrap[][] maps,
-                                         SessionProtocol p, SslContext sslCtx, boolean webSocket) {
-            bootstrap.handler(new ChannelInitializer<Channel>() {
-                @Override
-                protected void initChannel(Channel ch) throws Exception {
-                    ch.pipeline().addLast(
-                            new HttpClientPipelineConfigurator(clientFactory, webSocket, p, sslCtx));
-                }
-            });
-            maps[p.ordinal()][toIndex(webSocket)] = bootstrap;
-        }
-
-        private int toIndex(boolean webSocket) {
-            return webSocket ? 1 : 0;
-        }
-
-        private int toIndex(SerializationFormat serializationFormat) {
-            return toIndex(serializationFormat == SerializationFormat.WS);
-        }
-
     }
 }
