@@ -35,6 +35,9 @@ import io.netty.channel.EventLoop;
 import io.netty.channel.unix.DomainSocketAddress;
 import io.netty.handler.ssl.SslContext;
 
+/**
+ * A Data structure classes to simplify of {@link Bootstrap}.
+ */
 final class Bootstraps {
     private final Bootstrap[][] inetBootstraps;
     @Nullable
